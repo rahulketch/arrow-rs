@@ -24,7 +24,7 @@ use arrow_array::types::*;
 use arrow_array::*;
 use arrow_buffer::ArrowNativeType;
 use arrow_buffer::BooleanBufferBuilder;
-use arrow_data::ArrayDataBuilder;
+use arrow_data::{ArrayDataBuilder, ByteView, MAX_INLINE_VIEW_LEN};
 use arrow_schema::{ArrowError, DataType};
 use arrow_select::take::take;
 use std::cmp::Ordering;
@@ -310,11 +310,72 @@ fn sort_byte_view<T: ByteViewType>(
     options: SortOptions,
     limit: Option<usize>,
 ) -> UInt32Array {
-    let mut valids = value_indices
+    // 1. Build a list of (index, raw_view, length)
+    let mut valids: Vec<_> = value_indices
         .into_iter()
-        .map(|index| (index, values.value(index as usize).as_ref()))
-        .collect::<Vec<(u32, &[u8])>>();
-    sort_impl(options, &mut valids, &nulls, limit, Ord::cmp).into()
+        .map(|idx| {
+            // SAFETY: we know idx < values.len()
+            let raw = unsafe { *values.views().get_unchecked(idx as usize) };
+            let len = raw as u32; // lower 32 bits encode length
+            (idx, raw, len)
+        })
+        .collect();
+
+    // 2. Compute the number of non-null entries to partially sort
+    let vlimit = match (limit, options.nulls_first) {
+        (Some(l), true) => l.saturating_sub(nulls.len()).min(valids.len()),
+        _ => valids.len(),
+    };
+
+    // 3. Mixed comparator: first prefix, then inline vs full comparison
+    let cmp_mixed = |a: &(u32, u128, u32), b: &(u32, u128, u32)| {
+        let (_, raw_a, len_a) = *a;
+        let (_, raw_b, len_b) = *b;
+
+        // 3.1 Both inline (≤12 bytes): compare full 128-bit key including length
+        if len_a <= MAX_INLINE_VIEW_LEN && len_b <= MAX_INLINE_VIEW_LEN {
+            return GenericByteViewArray::<T>::inline_key_fast(raw_a)
+                .cmp(&GenericByteViewArray::<T>::inline_key_fast(raw_b));
+        }
+
+        // 3.2 Compare 4-byte prefix in big-endian order
+        let pref_a = ByteView::from(raw_a).prefix.swap_bytes();
+        let pref_b = ByteView::from(raw_b).prefix.swap_bytes();
+        if pref_a != pref_b {
+            return pref_a.cmp(&pref_b);
+        }
+
+        // 3.3 Fallback to full byte-slice comparison
+        let full_a: &[u8] = unsafe { values.value_unchecked(a.0 as usize).as_ref() };
+        let full_b: &[u8] = unsafe { values.value_unchecked(b.0 as usize).as_ref() };
+        full_a.cmp(full_b)
+    };
+
+    // 4. Partially sort according to ascending/descending
+    if !options.descending {
+        sort_unstable_by(&mut valids, vlimit, cmp_mixed);
+    } else {
+        sort_unstable_by(&mut valids, vlimit, |x, y| cmp_mixed(x, y).reverse());
+    }
+
+    // 5. Assemble nulls and sorted indices into final output
+    let total = valids.len() + nulls.len();
+    let out_limit = limit.unwrap_or(total).min(total);
+    let mut out = Vec::with_capacity(total);
+
+    if options.nulls_first {
+        // Place null indices first
+        out.extend_from_slice(&nulls[..nulls.len().min(out_limit)]);
+        let rem = out_limit - out.len();
+        out.extend(valids.iter().map(|&(i, _, _)| i).take(rem));
+    } else {
+        // Place non-null indices first
+        out.extend(valids.iter().map(|&(i, _, _)| i).take(out_limit));
+        let rem = out_limit - out.len();
+        out.extend_from_slice(&nulls[..rem]);
+    }
+
+    out.into()
 }
 
 fn sort_fixed_size_binary(
@@ -724,15 +785,48 @@ pub fn lexsort_to_indices(
         len = limit.min(len);
     }
 
-    let lexicographical_comparator = LexicographicalComparator::try_new(columns)?;
-    // uint32 can be sorted unstably
-    sort_unstable_by(&mut value_indices, len, |a, b| {
+    // Instantiate specialized versions of comparisons for small numbers
+    // of columns as it helps the compiler generate better code.
+    match columns.len() {
+        2 => {
+            sort_fixed_column::<2>(columns, &mut value_indices, len)?;
+        }
+        3 => {
+            sort_fixed_column::<3>(columns, &mut value_indices, len)?;
+        }
+        4 => {
+            sort_fixed_column::<4>(columns, &mut value_indices, len)?;
+        }
+        5 => {
+            sort_fixed_column::<5>(columns, &mut value_indices, len)?;
+        }
+        _ => {
+            let lexicographical_comparator = LexicographicalComparator::try_new(columns)?;
+            // uint32 can be sorted unstably
+            sort_unstable_by(&mut value_indices, len, |a, b| {
+                lexicographical_comparator.compare(*a, *b)
+            });
+        }
+    }
+    Ok(UInt32Array::from(
+        value_indices[..len]
+            .iter()
+            .map(|i| *i as u32)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+// Sort a fixed number of columns using FixedLexicographicalComparator
+fn sort_fixed_column<const N: usize>(
+    columns: &[SortColumn],
+    value_indices: &mut [usize],
+    len: usize,
+) -> Result<(), ArrowError> {
+    let lexicographical_comparator = FixedLexicographicalComparator::<N>::try_new(columns)?;
+    sort_unstable_by(value_indices, len, |a, b| {
         lexicographical_comparator.compare(*a, *b)
     });
-
-    Ok(UInt32Array::from_iter_values(
-        value_indices.iter().take(len).map(|i| *i as u32),
-    ))
+    Ok(())
 }
 
 /// It's unstable_sort, may not preserve the order of equal elements
@@ -778,6 +872,50 @@ impl LexicographicalComparator {
             })
             .collect::<Result<Vec<_>, ArrowError>>()?;
         Ok(LexicographicalComparator { compare_items })
+    }
+}
+
+/// A lexicographical comparator that wraps given array data (columns) and can lexicographically compare data
+/// at given two indices. This version of the comparator is for compile-time constant number of columns.
+/// The lifetime is the same at the data wrapped.
+pub struct FixedLexicographicalComparator<const N: usize> {
+    compare_items: [DynComparator; N],
+}
+
+impl<const N: usize> FixedLexicographicalComparator<N> {
+    /// lexicographically compare values at the wrapped columns with given indices.
+    pub fn compare(&self, a_idx: usize, b_idx: usize) -> Ordering {
+        for comparator in &self.compare_items {
+            match comparator(a_idx, b_idx) {
+                Ordering::Equal => continue,
+                r => return r,
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// Create a new lex comparator that will wrap the given sort columns and give comparison
+    /// results with two indices.
+    /// The number of columns should be equal to the compile-time constant N.
+    pub fn try_new(
+        columns: &[SortColumn],
+    ) -> Result<FixedLexicographicalComparator<N>, ArrowError> {
+        let compare_items = columns
+            .iter()
+            .map(|c| {
+                make_comparator(
+                    c.values.as_ref(),
+                    c.values.as_ref(),
+                    c.options.unwrap_or_default(),
+                )
+            })
+            .collect::<Result<Vec<_>, ArrowError>>()?
+            .try_into();
+        let compare_items: [Box<dyn Fn(usize, usize) -> Ordering + Send + Sync + 'static>; N] =
+            compare_items.map_err(|_| {
+                ArrowError::ComputeError("Could not create fixed size array".to_string())
+            })?;
+        Ok(FixedLexicographicalComparator { compare_items })
     }
 }
 
